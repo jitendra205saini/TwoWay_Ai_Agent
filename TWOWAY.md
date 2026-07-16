@@ -1,325 +1,368 @@
-# Two-Way AI CRM — Workflow & Lead Management Architecture
+# Two-Way AI CRM — Workflow & Lead Management System
 
-**Status:** design proposal
-**Extends:** `ARCHITECTURE.md` (intent), `N8N.md` (current implementation), `REPORT.md` (what actually runs today)
-**Stack decisions:** greenfield Postgres · Twilio / WhatsApp Cloud API (official) · ~1k leads/day · Python
-
----
-
-## 0. Read this section before the diagrams
-
-The existing system has one load-bearing rule:
-
-> **The LLM never executes. It only proposes. A human approves.**
-> — `ARCHITECTURE.md §1`
-
-Requirement 4 (two-way AI communication) breaks that rule. It cannot be reconciled by adding a queue, because:
-
-1. **A conversation cannot be human-approved per turn.** A lead who waits 40 minutes for a manager to approve "Sure — what's your team size?" is not in a conversation. The moment you approve per-turn, you have rebuilt a slow human agent with extra steps.
-2. **The injection defence in `REPORT.md` was structural, not behavioural.** The report is explicit and correct about this: the agent resisted the attack, *but the reason it didn't matter* is that `send_email` contained no email node. Zero emails could leave regardless of how fooled the model got.
-3. **A two-way channel is an outbound path to the attacker.** The untrusted `raw_message` author and the outbound message recipient are now **the same person**. That is a closed loop. The structural defence is gone, and only the behavioural one — the one the report honestly says "a different wording could get through someday" — remains.
-
-So the rule does not get abandoned. It gets **scoped**, by splitting actions into two classes that were previously one:
-
-| Class | Examples | Blast radius | Governance |
-|---|---|---|---|
-| **CRM state mutation** | `assign_lead`, `set_stage`, `merge_lead`, `set_owner` | Affects the business, other reps, reporting | **Unchanged.** `action_queue` → propose → approve → executor. Keep everything you built. |
-| **Conversation turn** | Reply to the lead on WhatsApp | Affects one thread with one lead | **New model.** Autonomous, but *bounded* — see §5. |
-
-The safety argument for the second class is not "a human checked it." It is **"the agent physically cannot say or do anything outside a narrow envelope."** That envelope is the whole design, and §5 is the most important section in this document.
-
-> **The sentence to take to Sidhant:** *"The propose-only rule still holds for everything that touches the CRM. For the conversation itself we replace human approval with a hard capability boundary — the chat agent has no CRM-write tools at all, and can only do three things: reply within a playbook, book a demo slot from a fixed list, or hand off to a human."*
+**Stack:** Python (FastAPI + Celery) · PostgreSQL · Redis · Twilio WhatsApp Cloud API · Twilio Voice
+**Scale target:** ~1k leads/day
+**Doc:** architecture blueprint · workflow logic · Phase 1 / Phase 2 roadmap
 
 ---
 
-## 1. Architecture blueprint
+## 1. Architecture Blueprint
 
 ```mermaid
 flowchart TB
     subgraph SRC["① SOURCES"]
-        FB["Meta Lead Ads<br/>(FB / IG)"]
-        CTWA["Click-to-WhatsApp<br/>ads ⭐"]
-        WEB["Website form"]
-        CSV["Excel import"]
+        FB["Meta Lead Ads<br/>(Facebook / Instagram)"]
+        CTWA["Click-to-WhatsApp ads ⭐"]
+        WEB["Website form / Organic"]
     end
 
     subgraph EDGE["② INGESTION — FastAPI"]
-        WH["/webhooks/*<br/>signature verify<br/>200 in &lt;3s"]
-        NORM["normalize · validate<br/>dedupe (pg_trgm)"]
+        WH["/webhooks/*<br/>signature verify → insert raw → 200 in &lt;3s"]
+        NORM["normalize · validate · dedupe"]
     end
 
-    subgraph CORE["③ POSTGRES — the truth"]
-        LEADS[("leads<br/>+company +campaign")]
-        ACCT[("accounts ⭐<br/>new-vs-existing")]
-        CONV[("conversations ⭐<br/>state machine")]
-        MSG[("messages ⭐<br/>append-only")]
-        SCHED[("scheduled_tasks ⭐<br/>durable timers")]
-        ASSIGN[("assignments ⭐<br/>SLA clock")]
-        AQ[("action_queue<br/>— existing")]
-        OUTBOX[("agent_outbox<br/>— existing")]
+    subgraph DB["③ POSTGRESQL — source of truth"]
+        LEADS[("leads")]
+        ACCT[("accounts")]
+        CONV[("conversations<br/>state machine")]
+        MSG[("messages<br/>append-only")]
+        SCHED[("scheduled_tasks<br/>durable timers")]
+        ASSIGN[("assignments<br/>SLA clock")]
+        PERF[("agent_performance_daily")]
     end
 
     subgraph WORK["④ WORKERS — Celery"]
-        SCORE["Scoring<br/>deterministic + LLM extract"]
-        ROUTE["Router<br/>weighted round-robin"]
-        ORCH["Conversation<br/>Orchestrator ⭐"]
-        SWEEP["Timer sweeper<br/>every 30s"]
+        SCORE["Scoring<br/>LLM extract + rules engine"]
+        ROUTE["Router"]
+        ORCH["Conversation Orchestrator ⭐"]
+        SWEEP["Timer sweeper (30s)"]
     end
 
-    subgraph AI["⑤ BOUNDED AGENTS"]
-        CHAT["Chat Agent<br/>3 tools only"]
+    subgraph AI["⑤ AI AGENTS"]
+        CHAT["Chat Agent<br/>WhatsApp"]
         VOICE["Voice Agent<br/>Phase 2"]
     end
 
-    subgraph OUT["⑥ CHANNELS"]
-        TW["Twilio<br/>WhatsApp Cloud API"]
-        TV["Twilio Voice<br/>+ ConversationRelay"]
+    subgraph CH["⑥ CHANNELS"]
+        TW["Twilio WhatsApp"]
+        TV["Twilio Voice"]
     end
 
-    subgraph HUM["⑦ HUMANS"]
-        SLACK["Slack approve/reject<br/>— existing"]
-        REP["Sales Agent / BDA<br/>takeover UI"]
-    end
-
+    REP["⑦ Sales Agent / BDA<br/>web UI + takeover"]
     RD[("REDIS<br/>locks · debounce · rate limit · kill switch")]
 
     FB --> WH
     CTWA --> WH
     WEB --> WH
-    CSV --> NORM
     WH --> NORM
     NORM --> LEADS
-    NORM --> OUTBOX
-    OUTBOX --> SCORE
-    SCORE -.->|company match| ACCT
-    SCORE --> ROUTE
-    ROUTE -->|"🔴 assign = propose"| AQ
-    AQ --> SLACK
-    SLACK -->|approved| ASSIGN
+    NORM --> SCORE
+    SCORE <-->|company match| ACCT
+    SCORE -->|"🔥 hot"| ROUTE
+    SCORE -.->|"❄️ cold"| X["nurture list<br/>no agent, no bot"]
+    ROUTE --> ASSIGN
+    ROUTE <-.-> PERF
     ASSIGN --> ORCH
     ORCH <--> CONV
     ORCH --> CHAT
     CHAT --> TW
-    TW -->|inbound webhook| WH
+    TW -->|inbound| WH
     WH --> MSG
     MSG --> ORCH
     ORCH --> SCHED
     SWEEP --> SCHED
-    SWEEP -->|no reply| VOICE
+    SWEEP -->|no chat reply| VOICE
     VOICE --> TV
-    SWEEP -->|SLA breach| REP
-    ORCH -->|human takeover| REP
-    REP -.->|mutes AI| CONV
+    TV -->|transcript| MSG
+    ORCH -->|AI done| REP
+    SWEEP -->|2h SLA breach| REP
+    REP -.->|takeover → mute AI| CONV
     ORCH <--> RD
     SWEEP <--> RD
 
-    style CTWA fill:#2d5016,color:#fff
     style ORCH fill:#7c2d12,color:#fff
     style CHAT fill:#7c2d12,color:#fff
+    style CTWA fill:#2d5016,color:#fff
     style RD fill:#7f1d1d,color:#fff
-    style AQ fill:#1e3a5f,color:#fff
-    style SLACK fill:#1e3a5f,color:#fff
 ```
 
-Blue = existing, unchanged. Red = new and load-bearing. Green = the thing that removes your biggest blocker (§9).
+### Component choices — and why
 
-### Why these components
+| Layer | Choice | Reasoning |
+|---|---|---|
+| **API / webhooks** | FastAPI | Twilio and Meta both retry on slow responses, and disable your endpoint if it keeps timing out. Pattern: verify signature → insert raw row → return 200 → process async. **Never** process inline. |
+| **Truth store** | PostgreSQL | Conversation state, assignments, SLA clocks. Anything whose loss would be a real incident. |
+| **Speed layer** | Redis | Locks, debounce, rate limits, kill switch. Test before putting anything here: *"agar Redis abhi flush ho jaaye, kya toota?"* Nothing → Redis is correct. Data lost → Postgres. |
+| **Workers** | Celery + beat | 1k/day is comfortable. Separate queues for `llm` (slow, I/O bound) and `default` so a Twilio outage can't starve scoring. |
+| **Timers** | **Postgres table + 30s sweeper** | See below — this is the one non-obvious call. |
+| **WhatsApp** | Twilio Cloud API | Official. No ban risk. Comes with the 24h window rule (§5). |
+| **Voice** | Twilio Voice / Vapi | Phase 2. |
+| **LLM** | Extraction + conversation only | Never for arithmetic. See §3. |
 
-| Choice | Reason |
-|---|---|
-| **FastAPI** for webhooks | Meta and Twilio both require a fast 2xx or they retry and eventually disable your endpoint. Receive → verify signature → insert raw → 200 → process async. **Never** process inline. |
-| **Postgres = truth, Redis = speed** | Your existing rule from `ARCHITECTURE.md §22` and it stays. Apply the same test: *"if Redis is flushed right now, what breaks?"* Nothing → Redis. Conversation state → Postgres. |
-| **Timers in Postgres, not Celery ETA** | `scheduled_tasks` table + a 30s sweeper. Celery's `countdown`/`eta` holds the task in a worker's memory — a restart during a 2-hour SLA window silently loses it, and you find out from an angry manager, not an alert. A table is durable, queryable, and debuggable ("show me every lead whose SLA fires in the next 10 min"). |
-| **Celery** | Team familiarity beats Arq's async-native edge here. If the LLM/Twilio I/O concurrency actually bites, move the orchestrator only to Arq. Don't pre-optimise. |
-| **Retain n8n** | See §10 — you keep what's built and working; the conversation layer is the part n8n genuinely can't do. |
+### Why timers live in Postgres, not Celery
+
+Celery's `countdown` / `eta` keeps the task in a worker's memory until it fires. Deploy during a 2-hour SLA window and the timer silently vanishes — you find out from an angry manager, not an alert.
+
+A `scheduled_tasks` table is durable across restarts, and queryable: *"show me every lead whose SLA fires in the next 10 minutes"* is a `SELECT`, not a mystery. A 30-second sweeper picks up due rows with `FOR UPDATE SKIP LOCKED`. For a system whose entire value is "act within 2 hours," the timer must be the most reliable component you own — not the most convenient.
 
 ---
 
-## 2. Data model — the delta
-
-Keep every existing table. Add these.
+## 2. Data Model
 
 ```sql
--- ⭐ The company entity. Requirement 2's "new or existing company" check.
--- This is a DB lookup, NOT an LLM call — consistent with your own rule:
--- "duplicate detection is a database query, not a model call" (REPORT §9).
-CREATE TABLE accounts (
-  id             bigserial PRIMARY KEY,
-  tenant_id      bigint NOT NULL,
-  name           text NOT NULL,
-  name_normal    text NOT NULL,        -- lower, no Pvt/Ltd/Inc, no punctuation
-  domain         text,                 -- from email, strongest signal
-  status         text NOT NULL,        -- 'prospect' | 'customer' | 'churned'
-  first_won_at   timestamptz,
-  created_at     timestamptz NOT NULL DEFAULT now()
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE TABLE users (                         -- Sales agents / BDAs
+  id           bigserial PRIMARY KEY,
+  name         text NOT NULL,
+  role         text NOT NULL DEFAULT 'bda',
+  is_active    boolean NOT NULL DEFAULT true,
+  shift_start  time, shift_end time,
+  wip_cap      int NOT NULL DEFAULT 25       -- max open leads. ⭐ see §4
 );
-CREATE INDEX idx_accounts_normal_trgm ON accounts USING gin (name_normal gin_trgm_ops);
-CREATE UNIQUE INDEX idx_accounts_domain ON accounts (tenant_id, domain) WHERE domain IS NOT NULL;
 
--- The two fields the meeting asked for that don't exist anywhere in your DDL today.
-ALTER TABLE leads ADD COLUMN company    text;
-ALTER TABLE leads ADD COLUMN campaign   text;        -- "service needed"
-ALTER TABLE leads ADD COLUMN account_id bigint REFERENCES accounts(id);
-ALTER TABLE leads ADD COLUMN is_existing_customer boolean;
+-- ⭐ Company entity — requirement 2's "new or existing company" check
+CREATE TABLE accounts (
+  id           bigserial PRIMARY KEY,
+  name         text NOT NULL,
+  name_normal  text NOT NULL,                -- lower, no "pvt ltd"/"inc", no punctuation
+  domain       text,                         -- from email — strongest signal
+  status       text NOT NULL,                -- 'prospect' | 'customer' | 'churned'
+  owner_id     bigint REFERENCES users(id),  -- existing customer → goes to THIS person
+  created_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_acct_trgm ON accounts USING gin (name_normal gin_trgm_ops);
+CREATE UNIQUE INDEX idx_acct_domain ON accounts (domain) WHERE domain IS NOT NULL;
 
--- ⭐ One row per lead per channel. The state machine lives here.
+-- Requirement 1: the capture fields
+CREATE TABLE leads (
+  id            bigserial PRIMARY KEY,
+  name          text NOT NULL,
+  phone         text NOT NULL,
+  email         text,
+  company       text,
+  source        text,                        -- facebook | instagram | organic | ...
+  campaign      text,                        -- service needed
+  account_id    bigint REFERENCES accounts(id),
+  is_existing   boolean,                     -- ⭐ filled by account match
+  score         int,
+  status        text NOT NULL DEFAULT 'new', -- new|hot|cold|engaged|demo_booked|won|lost
+  score_factors jsonb,                       -- ⭐ per-factor breakdown = explainability
+  raw_message   text,                        -- ⚠️ lead ne khud likha — UNTRUSTED
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_leads_status ON leads (status, created_at DESC);
+
+-- ⭐ Requirement 4: one row per lead per channel. The state machine.
 CREATE TYPE conv_state AS ENUM (
-  'pending', 'awaiting_optin', 'active', 'ai_complete',
-  'voice_pending', 'voice_attempted', 'human_owned',
-  'closed_won', 'closed_lost', 'abandoned', 'opted_out'
+  'pending','awaiting_optin','active','ai_complete',
+  'voice_pending','voice_done','human_owned',
+  'demo_booked','abandoned','opted_out'
 );
 
 CREATE TABLE conversations (
   id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  tenant_id         bigint NOT NULL,
   lead_id           bigint NOT NULL REFERENCES leads(id),
-  channel           text NOT NULL,             -- 'whatsapp' | 'voice'
+  channel           text NOT NULL,                    -- 'whatsapp' | 'voice'
   state             conv_state NOT NULL DEFAULT 'pending',
-  window_expires_at timestamptz,               -- ⭐ the 24h freeform window. §9
-  ai_muted          boolean NOT NULL DEFAULT false,  -- ⭐ human took over
-  playbook_version  text NOT NULL DEFAULT 'v1',
-  slots             jsonb NOT NULL DEFAULT '{}'::jsonb,  -- what AI has collected
+  window_expires_at timestamptz,                      -- ⭐ 24h freeform window. §5
+  ai_muted          boolean NOT NULL DEFAULT false,   -- ⭐ human took over
+  turn_count        smallint NOT NULL DEFAULT 0,      -- hard cap
+  slots             jsonb NOT NULL DEFAULT '{}',      -- what AI collected
   last_inbound_at   timestamptz,
-  last_outbound_at  timestamptz,
-  created_at        timestamptz NOT NULL DEFAULT now(),
   updated_at        timestamptz NOT NULL DEFAULT now()
 );
-CREATE UNIQUE INDEX uq_conv_lead_channel ON conversations (lead_id, channel);
+CREATE UNIQUE INDEX uq_conv ON conversations (lead_id, channel);
 
--- ⭐ Append-only. provider_message_id is what makes webhook retries harmless.
 CREATE TABLE messages (
   id                  bigserial PRIMARY KEY,
   conversation_id     uuid NOT NULL REFERENCES conversations(id),
-  direction           text NOT NULL,      -- 'in' | 'out'
-  author              text NOT NULL,      -- 'lead' | 'ai' | 'user:42'
-  body                text,               -- ⚠️ if direction='in' this is UNTRUSTED
-  template_name       text,               -- set when this was a template send
+  direction           text NOT NULL,        -- 'in' | 'out'
+  author              text NOT NULL,        -- 'lead' | 'ai' | 'user:42'
+  body                text,                 -- ⚠️ direction='in' → UNTRUSTED
+  template_name       text,                 -- set when this was a template send
   provider_message_id text,
-  status              text,               -- queued|sent|delivered|read|failed
-  error_code          text,
+  status              text,                 -- queued|sent|delivered|read|failed
   created_at          timestamptz NOT NULL DEFAULT now()
 );
--- ⭐ Twilio WILL redeliver. This index is the entire idempotency story.
+-- ⭐ Twilio WILL redeliver. This one index is the whole idempotency story.
 CREATE UNIQUE INDEX uq_msg_provider ON messages (provider_message_id)
   WHERE provider_message_id IS NOT NULL;
-CREATE INDEX idx_msg_conv ON messages (conversation_id, created_at DESC);
 
--- ⭐ Durable timers. Survives a worker restart; Celery ETA does not.
+-- ⭐ Durable timers
 CREATE TABLE scheduled_tasks (
   id          bigserial PRIMARY KEY,
-  tenant_id   bigint NOT NULL,
-  task_type   text NOT NULL,        -- 'voice_fallback' | 'sla_escalate' | 'nudge'
+  task_type   text NOT NULL,        -- 'voice_fallback' | 'sla_escalate' | 'abandon_check'
   lead_id     bigint,
   conv_id     uuid,
   due_at      timestamptz NOT NULL,
   dedupe_key  text NOT NULL,
-  status      text NOT NULL DEFAULT 'pending',  -- pending|done|cancelled|failed
-  attempts    smallint NOT NULL DEFAULT 0,
-  created_at  timestamptz NOT NULL DEFAULT now()
+  status      text NOT NULL DEFAULT 'pending',
+  attempts    smallint NOT NULL DEFAULT 0
 );
-CREATE UNIQUE INDEX uq_sched_dedupe ON scheduled_tasks (dedupe_key) WHERE status = 'pending';
+CREATE UNIQUE INDEX uq_sched ON scheduled_tasks (dedupe_key) WHERE status = 'pending';
 CREATE INDEX idx_sched_due ON scheduled_tasks (due_at) WHERE status = 'pending';
 
--- ⭐ The 2-hour SLA clock. Note sla_due_at is NULL until AI completes (§4).
+-- ⭐ Requirement 5: the 2-hour clock
 CREATE TABLE assignments (
-  id            bigserial PRIMARY KEY,
-  tenant_id     bigint NOT NULL,
-  lead_id       bigint NOT NULL REFERENCES leads(id),
-  agent_id      bigint NOT NULL REFERENCES users(id),
-  assigned_at   timestamptz NOT NULL DEFAULT now(),
-  ai_done_at    timestamptz,        -- ⭐ SLA clock starts HERE, not at assign
-  sla_due_at    timestamptz,        -- ai_done_at + 2h, business-hours adjusted
-  accepted_at   timestamptz,
-  outcome       text,               -- 'demo_booked'|'no_action'|'reassigned'
-  escalated_at  timestamptz
+  id           bigserial PRIMARY KEY,
+  lead_id      bigint NOT NULL REFERENCES leads(id),
+  agent_id     bigint NOT NULL REFERENCES users(id),
+  assigned_at  timestamptz NOT NULL DEFAULT now(),
+  ai_done_at   timestamptz,          -- ⭐ clock starts HERE, not at assign. §6
+  sla_due_at   timestamptz,          -- ai_done_at + 2h, business-hours adjusted
+  accepted_at  timestamptz,
+  outcome      text,                 -- demo_booked | no_action | reassigned
+  escalated_at timestamptz
 );
-CREATE INDEX idx_assign_sla ON assignments (sla_due_at)
+CREATE INDEX idx_sla ON assignments (sla_due_at)
   WHERE accepted_at IS NULL AND sla_due_at IS NOT NULL;
 
--- Phase 2. Nightly rollup — routing must never run live aggregates over leads.
+-- Phase 2 — routing reads THIS, never a live aggregate over leads
 CREATE TABLE agent_performance_daily (
-  tenant_id       bigint NOT NULL,
-  agent_id        bigint NOT NULL,
-  day             date NOT NULL,
-  leads_assigned  int NOT NULL DEFAULT 0,
-  demos_booked    int NOT NULL DEFAULT 0,
-  deals_won       int NOT NULL DEFAULT 0,
-  avg_response_s  int,
-  PRIMARY KEY (tenant_id, agent_id, day)
+  agent_id       bigint NOT NULL REFERENCES users(id),
+  day            date NOT NULL,
+  leads_assigned int NOT NULL DEFAULT 0,
+  demos_booked   int NOT NULL DEFAULT 0,
+  deals_won      int NOT NULL DEFAULT 0,
+  avg_response_s int,
+  PRIMARY KEY (agent_id, day)
 );
 
 CREATE TABLE demo_bookings (
-  id           bigserial PRIMARY KEY,
-  lead_id      bigint NOT NULL REFERENCES leads(id),
-  agent_id     bigint REFERENCES users(id),
-  slot_start   timestamptz NOT NULL,
-  booked_by    text NOT NULL,        -- 'ai' | 'user:42'
-  status       text NOT NULL DEFAULT 'scheduled',
-  created_at   timestamptz NOT NULL DEFAULT now()
+  id         bigserial PRIMARY KEY,
+  lead_id    bigint NOT NULL REFERENCES leads(id),
+  agent_id   bigint REFERENCES users(id),
+  slot_start timestamptz NOT NULL,           -- e.g. today 17:00
+  booked_by  text NOT NULL,                  -- 'ai' | 'user:42'
+  status     text NOT NULL DEFAULT 'scheduled'
+);
+
+CREATE TABLE audit_log (                     -- append-only
+  id         bigserial PRIMARY KEY,
+  lead_id    bigint,
+  action     text NOT NULL,
+  actor      text NOT NULL,                  -- 'ai' | 'user:42' | 'system'
+  before     jsonb, after jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
 );
 ```
 
-### The fifth DB role
-
-Your four-role scheme (`ARCHITECTURE.md §26`) extends naturally. The chat agent gets its own, and **it has no UPDATE on `leads` at all**:
-
-```sql
-CREATE ROLE crm_chat LOGIN PASSWORD 'change_me_chat';
-GRANT USAGE ON SCHEMA public TO crm_chat;
-GRANT SELECT ON conversations, messages, leads TO crm_chat;
-GRANT INSERT ON messages TO crm_chat;
-GRANT UPDATE (slots, last_outbound_at, updated_at) ON conversations TO crm_chat;
-GRANT INSERT ON demo_bookings TO crm_chat;
-GRANT INSERT ON action_queue TO crm_chat;   -- anything else it wants → proposal
--- Deliberately absent: UPDATE on leads, DELETE anywhere, SELECT on other leads.
-```
-
-This is the same idea as *"tool ki taakat uske naam se nahi, uske andar ke nodes se tay hoti hai"* — enforced by the database instead of by node layout. A fully-hijacked chat agent can insert a message into **its own thread** and nothing else.
-
 ---
 
-## 3. Lead scoring — keep the LLM away from the number
+## 3. Lead Scoring — keep the LLM away from the number
 
-Your architecture already says it: *"LLM ko probability guess mat karne do — wo maths me kachcha hai"* (`§12a`). The report proves it: *"once it invented a number instead of using the data."*
-
-So split the job:
+Requirement 2 says *"Background AI checks if the company is new or existing"* and *"assigns an initial Lead Score."* Both need splitting, because neither is fully an AI job.
 
 ```mermaid
 flowchart LR
-    A["Lead + raw_message"] --> B["LLM: EXTRACT only"]
-    B --> C["structured signals<br/>{budget_mentioned, urgency,<br/>team_size, intent_verb}"]
-    A --> D["DB lookups (no LLM)"]
-    D --> E["{is_existing_customer,<br/>source_quality,<br/>campaign_value,<br/>email_is_corporate}"]
-    C --> F["Deterministic<br/>scoring function<br/>— plain Python"]
+    A["Lead + raw_message"] --> B["LLM: EXTRACT only<br/>'does this text mention a budget?'"]
+    B --> C["signals:<br/>budget_mentioned, urgency,<br/>team_size, intent_verb"]
+    A --> D["DB lookups — NO LLM"]
+    D --> E["is_existing_customer<br/>source_quality<br/>campaign_value<br/>corporate_email"]
+    C --> F["Rules engine<br/>plain Python"]
     E --> F
-    F --> G["score 0-100<br/>+ per-factor breakdown"]
-    G --> H{"score >= threshold?"}
-    H -->|yes| I["🔥 Hot"]
-    H -->|no| J["❄️ Cold"]
+    F --> G["score 0-100<br/>+ score_factors jsonb"]
+    G --> H{"&gt;= threshold?"}
+    H -->|yes| I["🔥 HOT → route"]
+    H -->|no| J["❄️ COLD → nurture"]
     style B fill:#7c2d12,color:#fff
     style F fill:#2d5016,color:#fff
 ```
 
-The LLM answers *"does this text mention a budget?"* — a language question, which it is good at. The scoring function turns signals into a number — arithmetic, which it is bad at.
+**LLM ka kaam:** *"is text me budget ka zikr hai?"* — language question. Ye wo achha karta hai.
+**Rules engine ka kaam:** signals → number. Arithmetic. **LLM ye kharab karta hai** — wo number invent kar deta hai.
 
-**Why this matters beyond correctness:** a deterministic function is tunable, testable, and explainable. When Sidhant asks *"why is this lead 78?"* you show a per-factor breakdown, not a model's vibe. And when the threshold is wrong you change one constant instead of re-engineering a prompt.
+Aur teen practical wajah:
 
-**New-vs-existing company** is not an AI task:
+- **Tunable.** Threshold galat nikla → ek constant badlo. Prompt re-engineer mat karo.
+- **Testable.** Rules engine ka unit test likh sakte ho. Prompt ka nahi.
+- **Explainable.** Manager poochhega *"ye lead 78 kyun hai?"* → `score_factors` dikha do, model ki vibe nahi.
+
+### "New or existing company" is a DB query, not an AI call
 
 ```
-1. email domain → strip free providers (gmail/yahoo/outlook) → exact match accounts.domain
-2. no hit → normalize company name (lower, strip "pvt ltd"/"inc"/"llp", strip punctuation)
-        → pg_trgm similarity(name_normal, ?) > 0.85
-3. no hit → new account, INSERT with status='prospect'
-4. hit + status='customer' → is_existing_customer = true → this is an UPSELL, and it
-   should route to the account's existing owner, not into round-robin at all.
+1. email domain → free providers (gmail/yahoo) hatao → accounts.domain pe exact match
+2. miss → company name normalize (lower, "pvt ltd"/"inc"/"llp" strip, punctuation strip)
+        → pg_trgm: similarity(name_normal, ?) > 0.85
+3. miss → naya account, status='prospect'
+4. hit + status='customer' → is_existing = true
 ```
 
-Step 4 is a business rule the meeting didn't cover but will matter the first week: **an existing customer must not be cold-pitched by a bot.** Worth raising.
+Ek LLM call yahan paisa aur latency dono waste hai — `pg_trgm` "Sharma Industries" vs "Sharma Industries Pvt Ltd" already handle kar leta hai.
+
+**Aur step 4 pe ek business rule jo meeting me nahi aayi, par pehle hafte me aayegi:** agar lead ek **existing customer** hai, to wo round-robin me jaana hi nahi chahiye. Wo upsell hai, aur uske existing owner (`accounts.owner_id`) ko jaana chahiye. **Purane customer ko bot cold-pitch kare — ye bura dikhta hai.** Ye decide karwa lo.
 
 ---
 
-## 4. The workflow, step by step
+## 4. Routing — requirement 3 khud se ladti hai
+
+Heading likhi hai **"Round-Robin"**, andar likha hai **"best-performing agent ko assign karo"**. Ye do opposite policy hain:
+
+- **Round-robin** → sabko barabar, rotation me. Fair. Skill ignore karta hai.
+- **Performance-based** → achhe agent ko zyada. Conversion optimise karta hai. Fairness ignore karta hai.
+
+Aur pure performance me ek trap hai jo mahine do mahine me kaatega — **rich get richer:**
+
+> Top agent ko zyada lead → zyada demo → behtar numbers → aur zyada lead.
+> Naya BDA: koi history nahi → score kam → lead milti hi nahi → history banti hi nahi.
+
+Router ne chupchaap decide kar liya ki naya hire kabhi safal nahi hoga. Aur ye **data jaisa dikhta hai**, isliye koi sawal nahi uthata.
+
+### Resolution: round-robin = floor, performance = tilt
+
+```mermaid
+flowchart TD
+    A["🔥 Hot lead"] --> B{"is_existing<br/>customer?"}
+    B -->|yes| C["→ accounts.owner_id<br/>routing skip. §3"]
+    B -->|no| D["Eligible pool:<br/>is_active AND on-shift<br/>AND open_leads &lt; wip_cap"]
+    D --> E{"pool khali?"}
+    E -->|yes| F["→ manager queue<br/>⭐ hot lead kabhi drop mat karo"]
+    E -->|no| G{"roll 15%"}
+    G -->|explore| H["Plain round-robin<br/>least-recently-assigned<br/>⭐ naye BDA ko history milti hai"]
+    G -->|exploit 85%| I["Weighted pick<br/>w = perf_score"]
+    H --> J["assignments row<br/>→ chat agent trigger"]
+    I --> J
+    style H fill:#2d5016,color:#fff
+    style F fill:#7f1d1d,color:#fff
+```
+
+Teen cheezein kaam kar rahi hain:
+
+- **WIP cap** — 40 open lead wala best agent, lead 41 ke liye best nahi hai. **Capacity beats skill.** Akela yahi 80% faayda de deta hai.
+- **15% exploration** — cold-start trap ka sasta insurance. Naye BDA ko asli lead milti hai, asli record banta hai.
+- **perf_score** = demo-conversion ka EWMA over 1–6 months, `agent_performance_daily` se. Recency-weighted, taaki pichhle quarter ka star jo ab dheela pad gaya hai, decay ho jaaye. **Nightly rollup padho, live aggregate kabhi nahi** — routing har hot lead ke critical path pe baithi hai.
+
+### ⚠️ Performance routing Phase 1 me ho hi nahi sakta
+
+Ye priority ka faisla nahi hai, **data dependency hai.** perf_score ke liye outcome data chahiye (kitne demo book hue, kitne deal bane). Wo data Phase 1 chalne ke **baad** banega. Phase 1 me plain round-robin + WIP cap hi ja sakta hai — aur wo theek hai.
+
+---
+
+## 5. ⚠️ Requirement 4 ka asli blocker — 24-hour window
+
+**Official WhatsApp Cloud API me: jisne tumhe pichhle 24 ghante me message nahi kiya, use freeform message bhej hi nahi sakte.** Ye rate limit nahi — hard platform rule hai.
+
+Is design pe iska seedha asar:
+
+| # | Asar |
+|---|---|
+| **1** | **Pehli line AI likh hi nahi sakta.** Lead ne form bhara, tumhe message nahi kiya. To opening message = **Meta-approved template**, variable slots ke saath. |
+| **2** | **Approval me din lagte hain.** Reject bhi hota hai — tone, promotional dikhne pe, formatting pe. **Ye Phase 1 ka sabse lamba pole hai aur poori tarah tumhare control ke bahar hai.** |
+| **3** | **AI conversational tabhi banta hai jab lead reply kare.** Wo reply 24h window kholti hai. Matlab **template ka reply-rate hi asli funnel bottleneck hai — model nahi.** |
+| **4** | **Window beech me band ho sakti hai.** Lead ne 10:00 baje reply kiya, chup ho gaya, agle din 11:00 baje follow-up → blocked. `window_expires_at` track karo; bahar ho to template only. |
+
+### ⭐ Iska jugaad: Click-to-WhatsApp ads
+
+Leads already Facebook/Instagram se aa rahi hain. **CTWA ads me lead khud tumhe message karta hai** → window turant khulti hai → first contact ka template jhanjhat **poora khatam.**
+
+**Ye code nahi hai — campaign setting hai.** Marketing team se poochho. Poore project ka sabse zyada leverage isi ek cheez me hai, aur ye marketing detail jaisi dikhti hai jabki asal me **architecture dependency** hai.
+
+**Agli meeting me ye uthana.**
+
+---
+
+## 6. Workflow — step by step
 
 ```mermaid
 sequenceDiagram
@@ -327,245 +370,180 @@ sequenceDiagram
     participant L as Lead
     participant IN as Ingestion
     participant W as Workers
-    participant Q as action_queue
-    participant M as Manager
     participant C as Chat Agent
     participant T as Timers
+    participant V as Voice AI
     participant R as Sales Agent
 
-    L->>IN: fills FB/IG lead form
-    IN->>IN: verify sig · normalize · dedupe
-    IN-->>L: 200 OK (<3s, always)
-    IN->>W: outbox event lead.created
+    L->>IN: FB/IG lead form bhara
+    IN->>IN: sig verify · normalize · dedupe
+    IN-->>L: 200 OK (&lt;3s, hamesha)
 
-    W->>W: account match → new or existing?
-    W->>W: LLM extract → deterministic score
-    alt Cold
-        W->>W: nurture list. No agent, no bot. STOP.
-    else Hot 🔥
-        W->>W: pick agent (round-robin + WIP cap)
-        W->>Q: propose assign_lead (🔴 tier 2)
-        Q->>M: Slack: approve / reject
-        M->>Q: approved
-        Q->>W: executor writes assignments row
+    W->>W: account match → new ya existing?
+    W->>W: LLM extract → rules engine → score
+    alt ❄️ Cold
+        W->>W: nurture list. Koi agent nahi, koi bot nahi. STOP.
+    else 🔥 Hot
+        W->>W: eligible pool → round-robin → assignments row
+        W->>R: notify: nayi hot lead
     end
 
-    W->>C: start conversation
-    C->>L: TEMPLATE msg (only legal option — §9)
+    W->>C: conversation start
+    C->>L: TEMPLATE message (§5 — akela legal option)
     C->>T: schedule voice_fallback @ +15min
 
-    alt Lead replies ✅
-        L->>C: "yes, interested"
-        C->>C: 24h window OPENS
-        C->>T: CANCEL voice_fallback
-        loop bounded, max N turns
-            C->>L: freeform (playbook-scoped)
+    alt Lead reply karta hai ✅
+        L->>C: "haan, interested"
+        C->>C: 24h window KHULI
+        C->>T: ❌ CANCEL voice_fallback
+        loop max 12 turns
+            C->>L: freeform reply (playbook scope me)
             L->>C: reply
         end
-        C->>C: slots filled / demo booked
-        C->>W: ai_complete → set ai_done_at
+        C->>C: slots bhare / demo book hua
+        C->>W: ai_complete → ai_done_at set
         W->>T: schedule sla_escalate @ ai_done_at + 2h ⏰
-        W->>R: notify: hot lead, act in 2h
-    else No reply ⏱️
-        T->>T: fires. RE-CHECK state under FOR UPDATE
-        T->>L: 📞 Voice AI call (Phase 2)
+        W->>R: "hot lead ready — 2 ghante me act karo"
+    else Reply nahi aaya ⏱️
+        T->>T: fire. State RE-CHECK under FOR UPDATE ⚠️
+        T->>V: trigger
+        V->>L: 📞 call
+        V->>W: transcript → messages
     end
 
-    alt Agent acts in time
-        R->>W: accepted → SLA cancelled
-        R->>L: human takes over → ai_muted = true 🔇
-        R->>L: Demo booked 5 PM → sale
-    else 2h breach
-        T->>M: escalate to manager
-        T->>Q: propose reassign
+    alt Agent time pe act kiya
+        R->>W: accepted → SLA cancel
+        R->>L: takeover → ai_muted = true 🔇
+        R->>L: Demo 5 PM book → sale
+    else 2h breach ⏰
+        T->>R: manager ko escalate
+        T->>W: reassign propose
     end
 ```
 
-### The five places this breaks in production
+### ⚠️ Paanch jagah ye production me tootega
 
-Every one of these is cheap to handle now and expensive to discover later.
+Har ek abhi sasta hai, baad me mehenga.
 
-**① The reply/call race.** The lead replies at 14:59:58; the voice timer fires at 15:00:00. Without a guard you call someone mid-sentence. **Fix:** the timer job re-reads conversation state under `SELECT ... FOR UPDATE` *at execution time* and aborts unless still `awaiting_optin`. Scheduling-time checks are worthless — the whole point of a timer is that the world changed while it waited.
+**① Reply/call race — sabse gandi.** Lead ne 14:59:58 pe reply kiya, voice timer 15:00:00 pe fire hua. Guard ke bina tum use call kar doge jab wo abhi type kar raha hai.
+→ **Fix:** timer job **execution ke waqt** `SELECT ... FOR UPDATE` se state dobara padhe, aur `awaiting_optin` na ho to abort kare. Schedule-time check bekaar hai — **timer ka poora point hi yehi hai ki wait ke dauraan duniya badal gayi.**
 
-**② Double-texting.** Lead sends three rapid messages: "hi" / "need a demo" / "for 50 users". Three webhooks → three LLM turns → three replies. You look broken. **Fix:** per-conversation Redis debounce, ~3s. Coalesce, then run one turn on all three. (Redis is correct here — flushing it loses nothing.)
+**② Double-texting.** Lead ne teen message thok diye: "hi" / "demo chahiye" / "50 users ke liye". Teen webhook → teen LLM turn → teen reply. Tum broken dikhte ho.
+→ **Fix:** per-conversation Redis debounce, ~3s. Coalesce karke ek turn chalao.
 
-**③ Bot talks over human.** The rep takes over in the UI, but a queued AI turn fires 10 seconds later. **Fix:** `ai_muted` checked inside the send path, not the decision path. Every outbound re-reads it in the same transaction as the insert.
+**③ Bot insaan ke upar bolta hai.** Rep ne UI me takeover kiya, par 10 second pehle queue hua AI turn ab fire ho gaya.
+→ **Fix:** `ai_muted` **send path me** check karo, decision path me nahi. Har outbound usi transaction me flag dobara padhe jisme insert ho raha hai.
 
-**④ Webhook redelivery.** Twilio retries on any timeout — including one where you *did* process it. **Fix:** `uq_msg_provider`. Insert first, let the constraint reject the dupe, no-op on conflict.
+**④ Webhook redelivery.** Twilio timeout pe retry karta hai — us case me bhi jab tumne process kar hi liya tha.
+→ **Fix:** `uq_msg_provider`. Insert maaro, constraint dupe ko reject karega, `ON CONFLICT DO NOTHING`.
 
-**⑤ Two workers, one conversation.** **Fix:** Postgres advisory lock on `conversation_id`. You already had to solve this with `agent_locks` because n8n has no `SET NX` (`N8N.md §5`) — same pattern, and in Python you get real `pg_advisory_xact_lock`.
+**⑤ Do worker, ek conversation.**
+→ **Fix:** `pg_advisory_xact_lock(conversation_id)`.
 
-### On the 2-hour window — three unanswered questions
+### Requirement 5 ke teen adhoore sawal
 
-The requirement says the agent gets 2 hours "once the AI completes the initial engagement." That's underspecified in ways that will surface in week one. My proposal, all config, not code:
+Likha hai *"agent gets a 2-hour window once the AI completes the initial engagement."* Teen cheezein khuli hain jo pehle hafte me hi saamne aayengi:
 
-| Question | Proposal |
+| Sawal | Mera proposal |
 |---|---|
-| **2h from when, exactly?** | From `ai_done_at` — the AI marking engagement complete. Modelled as an explicit event, not "when the last message was sent." A lead who ghosts mid-conversation never sets it, so a *separate* abandonment timer is needed or those leads sit forever. |
-| **Does the clock run at 11 PM?** | No. Business-hours-aware. A lead arriving at 23:00 has an SLA of 11:00 next day, not 01:00. Otherwise every overnight lead breaches by morning and the escalation channel becomes noise people mute. |
-| **What happens at breach?** | Escalate to manager **and** propose reassignment into `action_queue`. Do not auto-reassign — that's a tier-2 CRM mutation and stays under your existing rule. |
+| **2 ghante kab se?** | `ai_done_at` se — AI ke engagement complete karne se. Ise **explicit event** banao, "last message ka time" nahi. **Catch:** jo lead beech me ghost kar de, uska `ai_done_at` kabhi set hi nahi hoga — wo hamesha ke liye latki rahegi. Isliye alag `abandon_check` timer chahiye. |
+| **Raat 11 baje clock chalega?** | **Nahi.** Business-hours aware. 23:00 wali lead ka SLA agli subah 11:00, raat 1 baje nahi. Warna har raat ki lead subah tak breach ho jaayegi, escalation channel shor ban jaayega, aur log **use mute kar denge** — jo poore feature ko maar deta hai. |
+| **Breach pe hota kya hai?** | Manager ko escalate **+** reassign propose karo. **Auto-reassign mat karo** — lead chupchaap kisi aur ke paas chali jaaye aur pehle agent ko pata bhi na chale, ye trust todta hai. |
 
 ---
 
-## 5. The conversation envelope — the actual safety story
+## 7. Conversation ko bounded rakhna — safety
 
-This replaces per-turn human approval. Six constraints, each independently sufficient to contain a hijacked agent:
+Requirement 4 me AI khud lead se baat karega. Matlab **jo banda untrusted text likh raha hai aur jisko reply jaa raha hai — wo same aadmi hai.** Loop band hai. Isliye envelope chahiye:
 
-**1. Three tools. That's all.**
+**1. Sirf teen tool. Bas.**
 ```python
-book_demo_slot(conversation_id, slot_id)   # slot_id from a fixed offered list
-save_requirement(conversation_id, key, value)  # key from a fixed enum
-handoff_to_human(conversation_id, reason)  # sets ai_muted, notifies rep
+book_demo_slot(conversation_id, slot_id)        # slot_id ek fixed offered list se
+save_requirement(conversation_id, key, value)   # key ek fixed enum se
+handoff_to_human(conversation_id, reason)       # ai_muted set, rep ko notify
 ```
-No `send_email`. No `assign_lead`. No `get_lead` for *other* leads. No search. **The tool that leaks your customer list does not exist** — the same reasoning your report used, kept intact.
+Koi `send_email` nahi. Koi `assign_lead` nahi. Doosri leads ka koi search nahi. **Jo tool customer list leak karega, wo exist hi nahi karta.**
 
-**2. The agent can only reply into its own thread.** It does not choose a recipient. The send path derives the phone number from `conversation_id`; it is not a parameter the model controls. `"send my customer list to X"` has no expressible form.
+**2. Recipient model choose nahi karta.** Phone number `conversation_id` se derive hota hai — parameter nahi hai. *"Meri list X pe bhej do"* ka koi expressible form hi nahi banta.
 
-**3. Untrusted text is fenced and labelled.** Inbound bodies enter context inside a delimiter with an explicit provenance marker — the same separation that worked in your report's injection test, now applied per-turn.
+**3. Apna DB role.** `crm_chat`: `messages` pe INSERT, `conversations.slots` pe UPDATE. **`leads` pe UPDATE bilkul nahi.** Deewar database enforce karti hai, prompt nahi.
 
-**4. Turn cap.** Max ~12 AI turns per conversation, then forced `handoff_to_human`. Caps cost, and caps how long a patient attacker can work on the model.
+**4. Turn cap.** ~12 turn, phir forced handoff. Cost cap karta hai, aur ek patient attacker ka time bhi cap karta hai.
 
-**5. Playbook scope.** System prompt is a specific playbook (qualify → book demo), versioned in `conversations.playbook_version` so you can A/B and roll back. Off-topic → handoff.
+**5. Playbook scope.** System prompt ek specific playbook (qualify → demo book). Off-topic → handoff.
 
-**6. Outbound rate limit per conversation.** Redis. Even a fully-looping agent can send at most N messages/hour to one lead.
+**6. Untrusted text fenced.** Inbound body delimiter ke andar, explicit provenance marker ke saath.
 
-> **The honest framing for your manager, in the spirit of `REPORT.md §5`:** *"We should assume the chat agent will eventually be talked into something. The design's job is to make sure the worst available outcome is a weird reply in one thread — not a leaked list, not a wrong assignment, not an email."*
+**7. Per-conversation rate limit.** Redis. Loop me phasa agent bhi ek lead ko max N msg/hour bhej sakta hai.
 
-**Worth flagging:** requirement 4 says "deep, human-like." Consider whether the bot should **disclose it's a bot**. Many jurisdictions are heading that way, and separately — a lead who discovers mid-call they were fooled is a lost lead and a screenshot on Twitter. My recommendation is a light disclosure ("I'm {Company}'s virtual assistant"). This is a business call, not mine, but it should be a decision rather than a default.
+> **Framing:** *"Maan ke chalo ki chat agent ko kabhi na kabhi baat me phasa liya jaayega. Design ka kaam ye hai ki us din ka worst outcome ek thread me ek weird reply ho — leaked list nahi, galat assignment nahi, email nahi."*
 
----
-
-## 6. Routing — the requirement contradicts itself
-
-Requirement 3 is headed **"Round-Robin"** and then describes **"assign to the best-performing agent."** Those are opposite policies:
-
-- **Round-robin** = every agent gets an equal share, in rotation. Fair, ignores skill.
-- **Performance-based** = the best agent gets the most. Optimises conversion, ignores fairness.
-
-Pure performance routing has a failure mode that will bite in month two: **rich-get-richer.** The top agent gets more leads → more demos → better numbers → more leads. Meanwhile a new BDA has no history, so they score low, so they get nothing, so they never build history. The routing function has quietly decided a new hire will never succeed — and it looks like data, so nobody questions it.
-
-**Resolution: round-robin is the floor, performance is the tilt.**
-
-```mermaid
-flowchart TD
-    A["Hot lead"] --> B{"Existing customer?"}
-    B -->|yes| C["→ account's current owner<br/>skip routing entirely"]
-    B -->|no| D["Eligible pool:<br/>active AND on-shift<br/>AND open_leads &lt; WIP cap"]
-    D --> E{"Pool empty?"}
-    E -->|yes| F["→ manager queue<br/>never drop a hot lead"]
-    E -->|no| G{"exploration roll<br/>15%"}
-    G -->|explore| H["Plain round-robin<br/>least-recently-assigned<br/>⭐ gives new BDAs a history"]
-    G -->|exploit 85%| I["Weighted pick<br/>w = perf_score"]
-    H --> J["Propose to action_queue 🔴"]
-    I --> J
-    J --> K["Manager approves"]
-    style H fill:#2d5016,color:#fff
-    style F fill:#7f1d1d,color:#fff
-```
-
-Three things carry the design:
-
-- **WIP cap** — the best agent with 40 open leads is not the best agent for lead 41. Capacity beats skill. This alone gets you most of the benefit.
-- **15% exploration** — cheap insurance against the cold-start trap. New agents get real leads and build a real record.
-- **Perf score = EWMA of demo-conversion over 1–6 months, from `agent_performance_daily`.** Recency-weighted so last quarter's star who's now coasting decays. Read the nightly rollup, never a live aggregate over `leads` — routing sits on the critical path of every hot lead.
-
-**Phase 1 ships only the eligible-pool + WIP cap + plain round-robin.** You cannot compute a performance score before you have outcome data, and you won't have outcome data until the system has run. Performance routing is *structurally* a Phase 2 feature — it's not a matter of priority, it's a data dependency.
+**Aur ek business call:** requirement me "human-like" likha hai. **Bot ko bot batana chahiye ya nahi?** Meri salaah — halka disclosure (*"main {Company} ka virtual assistant hoon"*). Jis lead ko beech me pata chale ki use bewakoof banaya gaya, wo gayi lead + screenshot. Ye business decision hai, par **decision hona chahiye — default nahi.**
 
 ---
 
-## 7. Voice AI — the honest Phase 2 note
+## 8. Voice AI — Phase 2
 
-Voice is correctly a fallback, and correctly Phase 2. Three notes:
+**Build:** **Vapi / Retell** pe prototype karo. Twilio ConversationRelay ek vendor me rakhta hai, par voice ka mushkil hissa **interruption handling aur latency** hai. Khud Media Streams + Deepgram + ElevenLabs pipeline banake pata chale ki turn-taking nahi ho raha — ye mehenga sabak hai. **v1 me hand-roll mat karo.**
 
-**Build:** Twilio Voice + **ConversationRelay** keeps you in one vendor and one bill. **Vapi/Retell** get you there faster with better turn-taking out of the box. Recommendation: prototype on Vapi, because voice's hard part is *interruption handling and latency*, and finding out your architecture can't do it after you've built an STT→LLM→TTS pipeline yourself is an expensive lesson. Do not hand-roll Media Streams + Deepgram + ElevenLabs for v1.
+**⚠️ Regulatory — build se pehle jawab chahiye.** Agar India hai to automated outbound calling pe **TRAI / DND / UCC** lagta hai. Consent aur registration optional nahi hain, aur penalty calling entity pe aati hai. Call recording ka apna consent chahiye.
+**Ye legal sawal hai, architecture ka nahi. Phase 2 scope karne se pehle jawab lo — ho sakta hai voice viable hi na ho.**
 
-**Regulatory — needs a real answer before build, not after.** Your demo data is Delhi/Mumbai, Hinglish, INR. If this is India, automated outbound calling runs into **TRAI DND / UCC regulations**; consent and registration are not optional and penalties attach to the calling entity. Call recording adds its own consent requirement. **This is a legal question, not an architecture question — get an answer before Phase 2 starts, because it may change whether voice is viable at all.**
-
-**Reuse the envelope.** The voice agent gets the same three tools, the same turn cap, the same `crm_chat`-equivalent role. Voice is a transport, not a new agent.
+**Envelope reuse karo.** Voice agent ko wahi 3 tool, wahi turn cap, wahi DB role. **Voice ek transport hai, naya agent nahi.**
 
 ---
 
-## 8. Phase 1 / Phase 2
+## 9. Roadmap
 
 ### Phase 1 — Core MVP
 
-**Goal: prove a lead can be captured, scored, routed, held in a real two-way WhatsApp conversation, and land on a rep's desk with a live SLA clock.** No voice. No performance routing.
+**Goal:** lead capture ho → score ho → route ho → **asli two-way WhatsApp conversation** chale → rep ke paas live 2h clock ke saath pahunche.
+**Nahi hai:** voice, performance routing.
 
-| # | Item | Notes |
+| # | Item | Note |
 |---|---|---|
-| 0 | **Meta business verification + WhatsApp template approval** | ⚠️ **Start day 1.** Blocks everything. Days-to-weeks, not hours. See §9. |
-| 1 | Schema: `accounts`, `conversations`, `messages`, `scheduled_tasks`, `assignments`, `+company`, `+campaign` | |
-| 2 | `crm_chat` role | Extends your existing four |
-| 3 | Ingestion: Meta Lead Ads + form webhooks, normalize, dedupe | Reuse WF-1's CTE logic |
-| 4 | Account matching, new-vs-existing | pg_trgm, no LLM |
-| 5 | Scoring: LLM extract + deterministic function + hot/cold | |
-| 6 | Routing: eligible pool + WIP cap + plain round-robin | Propose → existing Slack approval |
-| 7 | **Conversation orchestrator + state machine** | The hard part. Budget accordingly. |
-| 8 | **Chat agent, 3 tools, bounded** | |
-| 9 | Twilio send/receive + template + `uq_msg_provider` | |
-| 10 | Durable timers + 30s sweeper | |
-| 11 | 2h SLA + business hours + escalate | |
-| 12 | Human takeover / `ai_muted` | |
-| 13 | Demo booking | Fixed slots, no calendar integration yet |
-| 14 | Kill switch (finally connect Redis) | `REPORT.md` lists this as designed-not-connected |
+| **0** | **Meta business verification + WhatsApp template approval** | ⚠️ **Din 1 se shuru.** Sab kuch block karta hai. §5 |
+| 1 | Schema (§2) | |
+| 2 | Ingestion: Meta Lead Ads + form webhook, normalize, dedupe | |
+| 3 | Account match → new/existing (`pg_trgm`, no LLM) | §3 |
+| 4 | Scoring: LLM extract + rules engine + hot/cold | §3 |
+| 5 | Routing: eligible pool + WIP cap + **plain round-robin** | §4 |
+| 6 | **Conversation orchestrator + state machine** | ⭐ **sabse hard. Time yahan lagega.** |
+| 7 | **Chat agent — 3 tools, bounded** | §7 |
+| 8 | Twilio send/receive + template + `uq_msg_provider` | |
+| 9 | Durable timers + 30s sweeper | |
+| 10 | 2h SLA + business hours + escalate | §6 |
+| 11 | Human takeover / `ai_muted` | |
+| 12 | Demo booking (fixed slots, abhi calendar nahi) | |
+| 13 | Rep UI: my leads, thread view, takeover, accept | |
+| 14 | Kill switch (Redis) + audit log | |
 
-### Phase 2 — Advanced Routing & Voice
+### Phase 2 — Advanced Routing & Voice AI
 
 | # | Item | Depends on |
 |---|---|---|
-| 1 | `agent_performance_daily` + nightly rollup | Phase 1 outcome data existing |
+| 1 | `agent_performance_daily` + nightly rollup | Phase 1 ka outcome data |
 | 2 | Weighted routing + 15% exploration | ↑ |
-| 3 | Voice fallback (Vapi/ConversationRelay) | Regulatory answer (§7) |
-| 4 | Call transcript → `messages` | Unifies the thread |
-| 5 | Calendar integration for real slots | |
+| 3 | Voice fallback (Vapi / ConversationRelay) | **Regulatory jawab (§8)** |
+| 4 | Call transcript → `messages` (ek hi thread) | |
+| 5 | Calendar integration (asli slots) | |
 | 6 | Attribution dashboard: source/campaign → demo → won | |
-| 7 | Playbook A/B via `playbook_version` | |
+| 7 | Playbook A/B | |
 
-### Sequencing opinion
+### Sequencing — do salaah
 
-**Build the conversation before the routing.** Routing is a `SELECT ... ORDER BY last_assigned_at LIMIT 1` — you can write it in an afternoon and it will be *fine*. The two-way conversation is where the genuine unknowns are: the 24h window, the race conditions, whether the AI actually holds a useful conversation with a real lead. **Front-load the risk.** A perfect router feeding a broken conversation is a worse place to be in week three than the reverse.
+**1. Routing se pehle conversation banao.** Routing ek `ORDER BY last_assigned_at LIMIT 1` hai — ek shaam ka kaam, aur wo **theek chalega.** Asli unknown conversation me hai: 24h window, race conditions, aur sabse bada — **kya AI asli lead ke saath kaam ki baat kar bhi paata hai?**
+**Risk front-load karo.** Hafte teen me "perfect router + toota conversation" us se kahin bura hai jitna ulta.
 
-**And apply your own rule from `ARCHITECTURE.md §11`:** *"Phase 2 skip mat karna. Wahi wo phase hai jahan pata chalta hai agent bewakoof hai ya nahi."* The equivalent here: **run the chat agent in shadow mode first** — it drafts the reply, a human sends it, and you measure the edit rate. If reps rewrite 60% of drafts, you learn that on internal traffic instead of on real leads. Your report already sells this instinct ("the number decides, not opinion") and Sidhant has already bought it once.
-
----
-
-## 9. The blocker nobody mentions until it's too late
-
-**With the official Cloud API, you cannot send a freeform message to someone who hasn't messaged you in the last 24 hours.** This is not a rate limit; it's a hard platform rule.
-
-Consequences for this exact design:
-
-1. **First contact must be a pre-approved template.** The lead filled a form — they haven't messaged *you*. The AI's opening line is not AI-generated. It's a template Meta approved, with variable slots.
-2. **Approval takes days**, and templates get rejected for tone, for looking promotional, for formatting. Budget iterations. **This is the long pole in Phase 1 and it is entirely outside your control.**
-3. **The AI only becomes conversational after the lead replies.** That reply opens the 24h window. Design the template to maximise reply rate — that single message is the funnel's real bottleneck, not the model.
-4. **The window can close mid-conversation.** Lead replies at 10:00, goes quiet, agent follows up at 11:00 next day → blocked. Track `window_expires_at`; outside it, template only.
-
-**Click-to-WhatsApp ads are the way around this.** Since leads already come from Facebook/Instagram, CTWA ads have the lead message *you* first — which opens the window immediately and skips the template dance for first contact entirely. **If the marketing team can shift some ad spend to CTWA, that is the single highest-leverage change available to this project**, and it's a campaign setting, not code.
-
-Worth raising in the next meeting. It's the kind of thing that looks like a marketing detail and is actually an architecture dependency.
+**2. Shadow mode pehle chalao.** AI reply **draft** kare, insaan bheje, aur **edit rate naapo.** Agar reps 60% draft rewrite kar rahe hain, to ye baat internal traffic pe pata chale — asli lead pe nahi. Do hafte shadow, phir number dekh ke decide karo. **Number decide karega, opinion nahi.**
 
 ---
 
-## 10. n8n or Python?
+## 10. Agli meeting me ye 6 cheezein uthao
 
-You answered "Python," but `REPORT.md` says n8n won and six workflows exist. Both can be true:
-
-| Layer | Verdict |
-|---|---|
-| Cron sweeps, propose/approve, Slack, learning loop | **Keep in n8n.** Built, working, demoed. Nothing here is worth rewriting. |
-| **Conversation orchestrator** | **Python.** Non-negotiable, and `N8N.md` already argues my case: no transactions, no `SET NX`, no Lua. You worked around those for a propose-only agent with CTEs and `agent_locks`. A stateful two-way conversation needs per-conversation locking, debounce, sub-second state transitions, and race-safe timer guards. Every one of those is a workaround in n8n and a language feature in Python. |
-
-They share Postgres. n8n reads `conversations` for dashboards; the Python service owns writes to it. Clean seam, no rewrite, and you don't throw away work you've already shown your manager.
-
-**One caveat to raise honestly:** this makes two runtimes to operate. That's a real cost. It's still cheaper than either rewriting six working workflows or building a conversation state machine in a tool that can't hold a transaction.
-
----
-
-## Summary — the six things to take to the next meeting
-
-1. **The propose-only rule must be scoped, not deleted.** CRM mutations keep the approval queue. Conversation turns get a capability boundary instead. This is the central decision and it needs Sidhant's explicit sign-off, because it changes the safety story he already approved.
-2. **"Round-robin" and "best-performing agent" contradict each other.** Proposal: round-robin floor + performance tilt + WIP cap + 15% exploration. Needs a decision on fairness vs. conversion.
-3. **The 24-hour window is the real Phase 1 blocker.** Template approval starts day 1. Ask marketing about click-to-WhatsApp ads — it's the highest-leverage fix and it isn't code.
-4. **Performance routing is a data dependency, not a priority call.** It cannot ship in Phase 1 because the data it needs doesn't exist yet.
-5. **Voice needs a regulatory answer before it needs an architecture.** If this is India, TRAI/DND may constrain or kill it. Find out before Phase 2 is scoped.
-6. **Three questions the meeting left open:** does the 2h clock respect business hours; what happens to a lead who ghosts mid-conversation; does an existing customer get cold-pitched by the bot.
+1. **"Round-robin" aur "best-performing agent" ek doosre ke ulat hain.** Proposal: round-robin floor + performance tilt + WIP cap + 15% exploration. Fairness vs conversion pe **decision chahiye.**
+2. **24h window Phase 1 ka asli blocker hai.** Template approval din 1 se. **Marketing se click-to-WhatsApp ads poochho** — sabse bada leverage, aur wo code nahi hai.
+3. **Performance routing Phase 1 me ja hi nahi sakta** — data dependency hai, priority nahi.
+4. **Voice ko architecture se pehle legal jawab chahiye.** India hai to TRAI/DND scope badal ya khatam kar sakta hai.
+5. **Bot apne aap ko bot batayega ya nahi?** Business decision — default nahi.
+6. **Teen khule sawal:** (a) 2h clock business hours respect karega? (b) jo lead beech me ghost kar de uska kya? (c) existing customer ko bot cold-pitch karega?
