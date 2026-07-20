@@ -11,10 +11,10 @@ flowchart TD
 
   subgraph Agent Architecture
     direction TB
-    B1 --> D1[Enqueue agent.turn \n(trigger = INBOUND_MESSAGE)]
+    B1 --> D1["Enqueue agent.turn<br/> (trigger = INBOUND_MESSAGE)"]
     B2 --> D2[Eligibility Gate]
     D2 --> D3[Session Window Check]
-    D3 --> D4[Enqueue agent.turn \n(trigger = SCHEDULED)]
+    D3 --> D4["Enqueue agent.turn<br/> (trigger = SCHEDULED)"]
     D4 --> D1
 
     D1 --> E1[Conversation Lock + Debounce]
@@ -25,17 +25,17 @@ flowchart TD
     H1 --> F2[Guardrails POST]
     F2 --> I1[Save agent_turn + message]
     I1 --> J1[Enqueue Outbound Sender]
-    J1 --> K1[Outbound Sender \n(WhatsApp / Voice / Email)]
+    J1 --> K1["Outbound Sender<br/> (WhatsApp / Voice / Email)"]
     K1 --> L1[Delivery Status Update]
-    I1 --> M1[Async Post-Turn Tasks \n(rescore, memory, next outbound)]
+    I1 --> M1["Async Post-Turn Tasks<br/> (rescore, memory, next outbound)"]
   end
 
   subgraph Data + Services
     direction LR
-    P1[PostgreSQL \n(source-of-truth)]
-    P2[Redis / MQ \n(BullMQ)]
-    P3[LLM Provider \n(Claude / STT / TTS / Embedding)]
-    P4[Tool Layer \n(RAG, pricing, booking, follow-up, lead updates, handoff)]
+    P1["PostgreSQL<br/> (source-of-truth)"]
+    P2["Redis / MQ<br/> (BullMQ)"]
+    P3["LLM Provider<br/> (Claude / STT / TTS / Embedding)"]
+    P4["Tool Layer<br/> (RAG, pricing, booking, follow-up, lead updates, handoff)"]
   end
 
   E2 --> P1
@@ -66,7 +66,7 @@ flowchart TD
     F2 --> G6[Confidence >= 0.7?]
     G5 -->|fail| H2[Escalate to Human]
     G6 -->|fail| H2
-    H2 --> H3[conversation.mode=HUMAN \nstate=HUMAN_HANDOFF]
+    H2 --> H3["conversation.mode=HUMAN<br/> state=HUMAN_HANDOFF"]
     H3 --> H4[AI handoff brief + human notification]
     H4 --> H5[Bridge message to customer]
     H5 --> H7[AI silent, human resumes]
